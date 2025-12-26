@@ -169,33 +169,45 @@ impl DPLL {
 
     fn init_watches(&mut self) {
         for (clause_idx, clause) in self.formula.iter().enumerate() {
-            if clause.is_empty() {
-                continue;
-            }
-            if clause.len() == 1 {
-                self.initial_units.push(clause[0]);
-                continue;
-            }
-            // Pick first two literals
-            let w1 = clause[0];
-            let mut w2 = clause[1];
-            if clause.len() > 2 && w1 == w2 {
-                // find a different one
-                for &lit in clause.iter().skip(2) {
-                    if lit != w1 {
-                        w2 = lit;
-                        break;
-                    }
+            // --- Stage 1: Identify Watcher Candidates ---
+            // We use slice patterns to decompose the clause structure.
+            // The goal is to find two distinct literals to watch.
+            let candidates = match clause.as_slice() {
+                // Case: The clause is empty (should not happen in valid formulas)
+                [] => None,
+
+                // Case: Explicit unit clause (exactly one literal)
+                [lit] => Some((*lit, None)),
+
+                // Case: Multiple literals. w1 is the first literal,
+                // 'rest' is a slice of all subsequent literals.
+                [w1, rest @ ..] => {
+                    // SAT solvers require two different literals to watch.
+                    // We search 'rest' for the first literal that isn't w1.
+                    let w2 = rest.iter().find(|&&l| l != *w1).copied();
+                    Some((*w1, w2))
                 }
+            };
+
+            // --- Stage 2: Apply Watching Logic ---
+            // Based on the candidates found above, we update the solver state.
+            match candidates {
+                // Found two distinct literals: register them both in the watch lists.
+                Some((w1, Some(w2))) => {
+                    self.watches[clause_idx] = [w1, w2];
+                    self.watch_list.entry(w1).or_default().push(clause_idx);
+                    self.watch_list.entry(w2).or_default().push(clause_idx);
+                }
+
+                // Only one unique literal exists: this is treated as a unit clause.
+                // Unit clauses are added to the initial propagation queue.
+                Some((w1, None)) => {
+                    self.initial_units.push(w1);
+                }
+
+                // Empty clause: ignore and continue.
+                None => {}
             }
-            if w1 == w2 {
-                // all literals the same → unit clause
-                self.initial_units.push(w1);
-                continue;
-            }
-            self.watches[clause_idx] = [w1, w2];
-            self.watch_list.entry(w1).or_default().push(clause_idx);
-            self.watch_list.entry(w2).or_default().push(clause_idx);
         }
     }
 
