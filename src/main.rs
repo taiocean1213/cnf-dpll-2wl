@@ -138,47 +138,69 @@ impl DPLL {
     fn new(path: &str) -> io::Result<Self> {
         let file = File::open(path)?;
         let reader = BufReader::new(file);
+
         let mut n_vars = 0;
         let mut formula = Vec::new();
         let mut header_found = false;
 
-        for line in reader.lines() {
-            let line = line?.trim().to_string();
-            if line.is_empty() || line.starts_with('c') {
-                continue;
-            }
-            if line.starts_with("p cnf") {
-                let parts: Vec<&str> = line.split_whitespace().collect();
-                if parts.len() < 4 {
-                    return Err(io::Error::new(io::ErrorKind::InvalidData, "Bad header"));
+        for line_result in reader.lines() {
+            let line = line_result?.trim().to_string();
+
+            // 1. Classify the line and the current solver state simultaneously
+            // This flat match replaces all nested if/continue checks.
+            match (
+                line.as_str(),
+                line.starts_with('c'),
+                line.starts_with("p cnf"),
+                header_found,
+            ) {
+                // Skip empty lines or comments
+                ("", _, _, _) | (_, true, _, _) => (),
+
+                // Parse the header line
+                (_, _, true, _) => {
+                    let parts: Vec<&str> = line.split_whitespace().collect();
+
+                    // Nested logic is avoided by matching on the structural validity of 'parts'
+                    n_vars = match parts.as_slice() {
+                        [_, _, n, ..] => n.parse().map_err(|_| {
+                            io::Error::new(io::ErrorKind::InvalidData, "Bad n_vars")
+                        })?,
+                        _ => return Err(io::Error::new(io::ErrorKind::InvalidData, "Bad header")),
+                    };
+                    header_found = true;
                 }
-                n_vars = parts[2]
-                    .parse()
-                    .map_err(|_| io::Error::new(io::ErrorKind::InvalidData, "Bad n_vars"))?;
-                header_found = true;
-                continue;
-            }
-            if !header_found {
-                continue;
-            }
-            let clause: Clause = line
-                .split_whitespace()
-                .filter_map(|s| s.parse::<Literal>().ok())
-                .take_while(|&l| l != 0)
-                .collect();
-            if !clause.is_empty() {
-                formula.push(clause);
+
+                // Clause line: Only process if the header was already seen
+                (_, _, false, true) => {
+                    let clause: Clause = line
+                        .split_whitespace()
+                        .filter_map(|s| s.parse::<Literal>().ok())
+                        .take_while(|&l| l != 0)
+                        .collect();
+
+                    // Only add non-empty clauses
+                    match clause.is_empty() {
+                        false => formula.push(clause),
+                        true => (),
+                    }
+                }
+
+                // Ignore any lines appearing before the header
+                (_, _, false, false) => (),
             }
         }
 
+        // 2. Final assembly of the Solver state
         let n_clauses = formula.len();
         let mut solver = Self {
             formula,
             valuation: PartialValuation::new(n_vars),
-            watches: vec![[0, 0]; n_clauses], // use length before move
+            watches: vec![[0, 0]; n_clauses],
             watch_list: HashMap::new(),
             initial_units: Vec::new(),
         };
+
         solver.init_watches();
         Ok(solver)
     }
