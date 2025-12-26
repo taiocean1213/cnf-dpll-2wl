@@ -117,6 +117,15 @@ enum ConflictResolution {
     RootLevelReached,
 }
 
+/// Returns true if conflict detected
+#[derive(Debug)]
+enum ClausePropagationStatus {
+    Satisfied,
+    NewWatcherFound(Literal),
+    UnitClause(Literal),
+    Contradiction,
+}
+
 struct DPLL {
     formula: CNFFormula,
     valuation: PartialValuation,
@@ -305,65 +314,73 @@ impl DPLL {
         }
     }
 
-    /// Returns true if conflict detected
-    fn propagate(&mut self, falsified: Literal, queue: &mut Vec<Literal>) -> bool {
-        let Some(clauses_to_process) = self.watch_list.get_mut(&falsified) else {
+    fn propagate(&mut self, falsified: Literal, propagation_queue: &mut Vec<Literal>) -> bool {
+        // 1. Resolve the watch list for the falsified literal
+        let Some(watch_indices) = self.watch_list.get_mut(&falsified) else {
             return false;
         };
 
-        // Drain all clauses watching this literal into a local vec
-        let pending: Vec<usize> = clauses_to_process.drain(..).collect();
+        // Collect into a local vector to allow self-mutation during iteration
+        let pending_clauses: Vec<usize> = watch_indices.drain(..).collect();
 
-        for clause_idx in pending {
+        for clause_idx in pending_clauses {
             let clause = &self.formula[clause_idx];
+            let [w1, w2] = self.watches[clause_idx];
+            let other_watched = match w1 == falsified {
+                true => w2,
+                false => w1,
+            };
 
-            if clause.iter().any(|&lit| self.valuation.is_true(lit)) {
-                // Clause satisfied — keep watching falsified
-                self.watch_list
-                    .entry(falsified)
-                    .or_default()
-                    .push(clause_idx);
-                continue;
-            }
+            // 2. Determine the status of the clause in one flat match
+            let status = match clause.iter().any(|&lit| self.valuation.is_true(lit)) {
+                true => ClausePropagationStatus::Satisfied,
+                false => {
+                    // Seek a replacement literal: not the other watch, and not false
+                    let replacement = clause.iter().find(|&&lit| {
+                        lit != falsified && lit != other_watched && !self.valuation.is_false(lit)
+                    });
 
-            let watched = &mut self.watches[clause_idx];
-            let falsified_idx = if watched[0] == falsified { 0 } else { 1 };
-            let other = watched[1 - falsified_idx];
-
-            // Try to find a new watch literal
-            let mut found_new = false;
-            for &lit in clause {
-                if lit == falsified || lit == other {
-                    continue;
+                    // Match the replacement search result against the 'other' literal's state
+                    match (replacement, self.valuation.is_undef(other_watched)) {
+                        (Some(&new_lit), _) => ClausePropagationStatus::NewWatcherFound(new_lit),
+                        (None, true) => ClausePropagationStatus::UnitClause(other_watched),
+                        (None, false) => ClausePropagationStatus::Contradiction,
+                    }
                 }
-                if !self.valuation.is_false(lit) {
-                    watched[falsified_idx] = lit;
-                    self.watch_list.entry(lit).or_default().push(clause_idx);
-                    found_new = true;
-                    break;
+            };
+
+            // 3. Single-level execution of the determined status
+            match status {
+                ClausePropagationStatus::Satisfied | ClausePropagationStatus::UnitClause(_) => {
+                    // If satisfied or unit, we must keep watching the current falsified literal
+                    self.watch_list
+                        .entry(falsified)
+                        .or_default()
+                        .push(clause_idx);
+
+                    // If unit, also push the implication to the queue
+                    match status {
+                        ClausePropagationStatus::UnitClause(lit) => propagation_queue.push(lit),
+                        _ => (),
+                    }
                 }
-            }
-
-            if found_new {
-                continue;
-            }
-
-            // Could not find new watch
-            if self.valuation.is_undef(other) {
-                queue.push(other);
-                // Still keep watching falsified
-                self.watch_list
-                    .entry(falsified)
-                    .or_default()
-                    .push(clause_idx);
-            } else {
-                // Conflict!
-                // Put back the clause so it's not lost
-                self.watch_list
-                    .entry(falsified)
-                    .or_default()
-                    .push(clause_idx);
-                return true;
+                ClausePropagationStatus::NewWatcherFound(new_lit) => {
+                    // Update the internal watch pair for this clause
+                    let pos = match self.watches[clause_idx][0] == falsified {
+                        true => 0,
+                        false => 1,
+                    };
+                    self.watches[clause_idx][pos] = new_lit;
+                    self.watch_list.entry(new_lit).or_default().push(clause_idx);
+                }
+                ClausePropagationStatus::Contradiction => {
+                    // Restore the watch before returning to maintain solver invariants
+                    self.watch_list
+                        .entry(falsified)
+                        .or_default()
+                        .push(clause_idx);
+                    return true;
+                }
             }
         }
 
