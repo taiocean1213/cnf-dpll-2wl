@@ -191,8 +191,10 @@ impl DPLL {
 
         loop {
             while let Some(lit) = queue.pop() {
-                if !self.valuation.is_undef(lit) {
-                    if self.valuation.is_false(lit) {
+                let is_assigned = !self.valuation.is_undef(lit);
+                if is_assigned {
+                    let is_already_false = self.valuation.is_false(lit);
+                    if is_already_false {
                         if !self.handle_conflict(&mut queue) {
                             return false;
                         }
@@ -200,22 +202,43 @@ impl DPLL {
                     continue;
                 }
                 self.valuation.assign(lit, false);
-                if self.propagate(-lit, &mut queue) {
-                    if !self.handle_conflict(&mut queue) {
+
+                // Capture the result of the propagation attempt
+                let found_conflict = self.propagate(-lit, &mut queue);
+                if found_conflict {
+                    // Define the resolution status
+                    let is_resolvable = self.handle_conflict(&mut queue);
+
+                    // If the conflict cannot be resolved (e.g., at root level),
+                    // the formula is UNSAT
+                    if !is_resolvable {
                         return false;
                     }
                 }
             }
 
-            let decision_var = self.valuation.next_undef_var();
-            if decision_var == NULL_LITERAL {
-                return true; // SAT
+            // Selection: Identify the next branching point
+            let next_var = self.valuation.next_undef_var();
+
+            // If no variables are left to assign, the current model satisfies the formula
+            if next_var == NULL_LITERAL {
+                return true; // Satisfiable (SAT)
             }
-            let decision_lit = decision_var;
+
+            // 2. Decision: Branch on the selected literal
+            let decision_lit = next_var;
             self.valuation.assign(decision_lit, true);
-            if self.propagate(-decision_lit, &mut queue) {
-                if !self.handle_conflict(&mut queue) {
-                    return false; // UNSAT
+
+            // 3. Propagation: Check if the opposite assignment causes a contradiction
+            let propagation_found_conflict = self.propagate(-decision_lit, &mut queue);
+
+            if propagation_found_conflict {
+                // 4. Resolution: Attempt to recover from the conflict (e.g., via backjumping)
+                let is_recoverable = self.handle_conflict(&mut queue);
+
+                // If the conflict is at the root level, no solution exists
+                if !is_recoverable {
+                    return false; // Unsatisfiable (UNSAT)
                 }
             }
         }
