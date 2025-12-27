@@ -9,6 +9,23 @@ pub struct Clause {
     pub visit_count: usize,
 }
 
+impl Clause {
+    /// High-level logic: search for a literal that isn't falsified and isn't currently watched.
+    fn find_replacement_watch(&self, assign: &[Option<bool>]) -> Option<usize> {
+        self.lits.iter().enumerate().position(|(j, &cand)| {
+            j != self.w[0] && j != self.w[1] && Solver::get_val(assign, cand) != Some(false)
+        })
+    }
+}
+
+/// A context object to solve the "Long Parameter List" smell.
+/// Bundles mutable references needed during propagation.
+struct StateRef<'a> {
+    assign: &'a mut [Option<bool>],
+    watch: &'a mut Vec<Vec<usize>>,
+    q: &'a mut Vec<Lit>,
+}
+
 pub struct Solver {
     pub clauses: Vec<Clause>,
     pub assign: Vec<Option<bool>>,
@@ -19,167 +36,209 @@ impl Solver {
     pub fn new(path: &str) -> Result<Self> {
         let mut n_vars = 0;
         let mut clauses = Vec::new();
-        for l in BufReader::new(File::open(path)?)
+        let lines = BufReader::new(File::open(path)?)
             .lines()
-            .map_while(Result::ok)
-        {
-            if l.starts_with('c') || l.is_empty() {
-                continue;
-            }
-            if l.starts_with("p cnf") {
-                n_vars = l
-                    .split_whitespace()
-                    .nth(2)
-                    .unwrap_or("0")
-                    .parse()
-                    .unwrap_or(0);
-                continue;
-            }
-            let lits: Vec<Lit> = l
-                .split_whitespace()
-                .filter_map(|s| s.parse().ok())
-                .take_while(|&x| x != 0)
-                .collect();
+            .map_while(Result::ok);
 
-            let len = lits.len();
-            clauses.push(Clause {
-                lits,
-                w: [0, 1.min(len.saturating_sub(1))],
-                visit_count: 0,
-            });
+        for line in lines {
+            Self::parse_line(line, &mut n_vars, &mut clauses);
         }
-        let mut watch = vec![Vec::new(); (n_vars + 1) * 2];
-        for (i, c) in clauses.iter().enumerate() {
-            if !c.lits.is_empty() {
-                watch[Self::idx(c.lits[c.w[0]])].push(i);
-                if c.lits.len() > 1 {
-                    watch[Self::idx(c.lits[c.w[1]])].push(i);
-                }
-            }
-        }
-        Ok(Self {
+
+        let mut solver = Self {
             clauses,
             assign: vec![None; n_vars + 1],
-            watch,
-        })
+            watch: vec![Vec::new(); (n_vars + 1) * 2],
+        };
+
+        solver.init_watches();
+        Ok(solver)
     }
 
-    fn idx(l: Lit) -> usize {
-        if l > 0 {
-            l as usize * 2
-        } else {
-            (-l) as usize * 2 + 1
+    fn parse_line(l: String, n_vars: &mut usize, clauses: &mut Vec<Clause>) {
+        if l.starts_with('c') || l.is_empty() {
+            return;
+        }
+        if l.starts_with("p cnf") {
+            *n_vars = l
+                .split_whitespace()
+                .nth(2)
+                .and_then(|s| s.parse().ok())
+                .unwrap_or(0);
+            return;
+        }
+
+        let lits: Vec<Lit> = l
+            .split_whitespace()
+            .filter_map(|s| s.parse().ok())
+            .take_while(|&x| x != 0)
+            .collect();
+
+        let len = lits.len();
+        clauses.push(Clause {
+            lits,
+            w: [0, 1.min(len.saturating_sub(1))],
+            visit_count: 0,
+        });
+    }
+
+    fn init_watches(&mut self) {
+        for (i, c) in self.clauses.iter().enumerate() {
+            c.lits
+                .get(c.w[0])
+                .iter()
+                .for_each(|&&l| self.watch[Self::idx(l)].push(i));
+            if c.lits.len() > 1 {
+                self.watch[Self::idx(c.lits[c.w[1]])].push(i);
+            }
         }
     }
 
-    fn val(&self, l: Lit) -> Option<bool> {
-        self.assign[l.abs() as usize].map(|v| v == (l > 0))
+    #[inline]
+    fn idx(l: Lit) -> usize {
+        (l.abs() as usize * 2) + (l < 0) as usize
+    }
+
+    #[inline]
+    fn get_val(assign: &[Option<bool>], l: Lit) -> Option<bool> {
+        assign[l.abs() as usize].map(|v| v == (l > 0))
     }
 
     pub fn propagate(&mut self, start: Lit) -> bool {
         let mut q = vec![start];
         while let Some(l) = q.pop() {
-            let falsified = Self::idx(-l);
-            let mut i = 0;
-            while i < self.watch[falsified].len() {
-                let cid = self.watch[falsified][i];
-                self.clauses[cid].visit_count += 1;
-
-                if self.clauses[cid].lits[self.clauses[cid].w[0]] == -l {
-                    self.clauses[cid].w.swap(0, 1);
-                }
-
-                let w0 = self.clauses[cid].lits[self.clauses[cid].w[0]];
-                if self.val(w0) == Some(true) {
-                    i += 1;
-                    continue;
-                }
-
-                let mut found = false;
-                for j in 0..self.clauses[cid].lits.len() {
-                    let cand = self.clauses[cid].lits[j];
-                    if j != self.clauses[cid].w[0]
-                        && j != self.clauses[cid].w[1]
-                        && self.val(cand) != Some(false)
-                    {
-                        self.clauses[cid].w[1] = j;
-                        self.watch[falsified].swap_remove(i);
-                        self.watch[Self::idx(cand)].push(cid);
-                        found = true;
-                        break;
-                    }
-                }
-                if found {
-                    continue;
-                }
-
-                if self.val(w0) == Some(false) {
-                    return false;
-                }
-                if self.val(w0).is_none() {
-                    self.assign[w0.abs() as usize] = Some(w0 > 0);
-                    q.push(w0);
-                }
-                i += 1;
+            if !self.process_watch_list(l, &mut q) {
+                return false;
             }
         }
         true
+    }
+
+    fn process_watch_list(&mut self, lit: Lit, q: &mut Vec<Lit>) -> bool {
+        let falsified_idx = Self::idx(-lit);
+        let mut watch_list = std::mem::take(&mut self.watch[falsified_idx]);
+        let mut conflict = false;
+
+        let mut state = StateRef {
+            assign: &mut self.assign,
+            watch: &mut self.watch,
+            q,
+        };
+
+        watch_list.retain(|&cid| {
+            if conflict {
+                return true;
+            }
+            let (keep, is_conflict) =
+                Self::update_clause(&mut self.clauses[cid], -lit, cid, &mut state);
+            conflict = is_conflict;
+            keep
+        });
+
+        self.watch[falsified_idx].extend(watch_list);
+        !conflict
+    }
+
+    /// Returns (keep_in_current_watch_list, is_conflict)
+    fn update_clause(
+        c: &mut Clause,
+        falsified: Lit,
+        cid: usize,
+        state: &mut StateRef,
+    ) -> (bool, bool) {
+        c.visit_count += 1;
+        if c.lits[c.w[0]] == falsified {
+            c.w.swap(0, 1);
+        }
+
+        let w0 = c.lits[c.w[0]];
+        if Self::get_val(state.assign, w0) == Some(true) {
+            return (true, false);
+        }
+
+        if let Some(j) = c.find_replacement_watch(state.assign) {
+            c.w[1] = j;
+            state.watch[Self::idx(c.lits[j])].push(cid);
+            return (false, false);
+        }
+
+        match Self::get_val(state.assign, w0) {
+            Some(false) => (true, true),
+            None => {
+                state.assign[w0.abs() as usize] = Some(w0 > 0);
+                state.q.push(w0);
+                (true, false)
+            }
+            _ => (true, false),
+        }
     }
 
     pub fn solve(&mut self) -> bool {
         if self.clauses.iter().any(|c| c.lits.is_empty()) {
             return false;
         }
-        for idx in 0..self.clauses.len() {
-            if self.clauses[idx].lits.len() == 1 {
-                let lit = self.clauses[idx].lits[0];
-                if self.val(lit) == Some(false) {
-                    return false;
-                }
-                if self.val(lit).is_none() {
-                    self.assign[lit.abs() as usize] = Some(lit > 0);
-                    if !self.propagate(lit) {
-                        return false;
-                    }
-                }
-            }
+
+        let units: Vec<Lit> = self
+            .clauses
+            .iter()
+            .filter(|c| c.lits.len() == 1)
+            .map(|c| c.lits[0])
+            .collect();
+
+        if units.into_iter().any(|l| !self.apply_initial_unit(l)) {
+            return false;
         }
+
         self.solve_recursive()
     }
 
+    fn apply_initial_unit(&mut self, lit: Lit) -> bool {
+        match Self::get_val(&self.assign, lit) {
+            Some(false) => false,
+            Some(true) => true,
+            None => {
+                self.assign[lit.abs() as usize] = Some(lit > 0);
+                self.propagate(lit)
+            }
+        }
+    }
+
     fn solve_recursive(&mut self) -> bool {
-        let var = match self
+        let var = self
             .assign
             .iter()
             .enumerate()
             .skip(1)
             .find(|(_, a)| a.is_none())
-        {
-            Some((v, _)) => v,
-            None => return true,
+            .map(|(v, _)| v);
+
+        let Some(v) = var else {
+            return true;
         };
-        for pol in [true, false] {
-            let (old_a, old_w) = (self.assign.clone(), self.watch.clone());
-            self.assign[var] = Some(pol);
-            if self.propagate(if pol { var as i32 } else { -(var as i32) })
-                && self.solve_recursive()
-            {
-                return true;
-            }
-            self.assign = old_a;
-            self.watch = old_w;
+
+        [true, false]
+            .into_iter()
+            .any(|pol| self.try_assignment(v, pol))
+    }
+
+    fn try_assignment(&mut self, var: usize, pol: bool) -> bool {
+        let (old_a, old_w) = (self.assign.clone(), self.watch.clone());
+        self.assign[var] = Some(pol);
+
+        let lit = if pol { var as i32 } else { -(var as i32) };
+        if self.propagate(lit) && self.solve_recursive() {
+            return true;
         }
+
+        self.assign = old_a;
+        self.watch = old_w;
         false
     }
 
     pub fn print_model(&self) {
-        for (i, a) in self.assign.iter().enumerate().skip(1) {
-            match a {
-                Some(true) => print!("{i} "),
-                Some(false) => print!("-{i} "),
-                None => {}
-            }
-        }
+        self.assign.iter().enumerate().skip(1).for_each(|(i, &a)| {
+            a.iter()
+                .for_each(|&val| if val { print!("{i} ") } else { print!("-{i} ") });
+        });
         println!("0");
     }
 }
