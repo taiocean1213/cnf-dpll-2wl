@@ -1,4 +1,4 @@
-# dpll-2wl
+# cnf-dpll-2wl
 Created in [C++](https://cplusplus.com/) by [Petar Kukolj](https://github.com/qkolj), Remastered to [Rust](https://rust-lang.org/) by [Tai Alex](https://github.com/taiocean1213).
 
 
