@@ -22,13 +22,14 @@ impl Clause {
     }
 }
 
+/// Added trail to state so unit assignments can be tracked for backtracking
 struct PropagationState<'a> {
     assignments: &'a mut [Option<bool>],
     watch_lists: &'a mut Vec<Vec<usize>>,
     propagation_queue: &'a mut Vec<Literal>,
+    trail: &'a mut Vec<usize>,
 }
 
-/// Represents a choice made by the solver during search.
 struct Decision {
     var: usize,
     tried_polarity: bool,
@@ -131,8 +132,10 @@ impl Solver {
 
     fn assign(&mut self, lit: Literal) {
         let var = Self::lit_to_var(lit);
-        self.assignments[var] = Some(lit > 0);
-        self.trail.push(var);
+        if self.assignments[var].is_none() {
+            self.assignments[var] = Some(lit > 0);
+            self.trail.push(var);
+        }
     }
 
     fn undo_to_level(&mut self, level: usize) {
@@ -163,6 +166,7 @@ impl Solver {
             assignments: &mut self.assignments,
             watch_lists: &mut self.watch_lists,
             propagation_queue: queue,
+            trail: &mut self.trail, // Pass trail here
         };
 
         affected.retain(|&cid| {
@@ -204,7 +208,10 @@ impl Solver {
         match Self::get_literal_value(state.assignments, w0) {
             Some(false) => (true, true),
             None => {
-                state.assignments[Self::lit_to_var(w0)] = Some(w0 > 0);
+                // FIXED: Record the unit assignment on the trail
+                let var = Self::lit_to_var(w0);
+                state.assignments[var] = Some(w0 > 0);
+                state.trail.push(var);
                 state.propagation_queue.push(w0);
                 (true, false)
             }
@@ -222,7 +229,6 @@ impl Solver {
     }
 
     pub fn solve(&mut self) -> bool {
-        // 1. Initial Unit Propagation
         if !self.initial_propagation() {
             return false;
         }
@@ -231,13 +237,10 @@ impl Solver {
 
         loop {
             let var = self.pick_branching_variable();
-
-            // Success Case: No more variables to assign
             if var.is_none() {
                 return true;
             }
 
-            // Make a new decision (defaulting to true)
             let current_var = var.unwrap();
             decision_stack.push(Decision {
                 var: current_var,
@@ -249,27 +252,21 @@ impl Solver {
             let lit = Self::make_lit(current_var, true);
             self.assign(lit);
 
-            // If propagation fails, enter backtracking loop
             if !self.propagate(lit) {
                 if !self.backtrack(&mut decision_stack) {
-                    return false; // Exhausted search space (UNSAT)
+                    return false;
                 }
             }
         }
     }
 
-    /// Handles the "Undo" logic and flipping polarities.
-    /// Returns true if we successfully pivoted to a new branch, false if UNSAT.
     fn backtrack(&mut self, stack: &mut Vec<Decision>) -> bool {
         while let Some(mut decision) = stack.pop() {
-            // If we've already tried both true and false for this variable,
-            // undo and keep popping up the stack.
             if decision.tried_both {
                 self.undo_to_level(stack.len());
                 continue;
             }
 
-            // Otherwise, flip the polarity and try again.
             self.undo_to_level(stack.len());
 
             decision.tried_polarity = !decision.tried_polarity;
@@ -285,7 +282,6 @@ impl Solver {
             if ok {
                 return true;
             }
-            // If flipping still causes a conflict, the loop will pop this again.
         }
         false
     }

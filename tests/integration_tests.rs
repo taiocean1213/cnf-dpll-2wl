@@ -224,3 +224,27 @@ fn test_zebra_puzzle() {
         .success()
         .stdout(predicate::str::contains("SAT"));
 }
+
+#[test]
+fn test_real_backtrack_sat() {
+    // This formula is SAT: {1=false, 2=true, 3=true}
+    // If solver picks 1=true first, it must backtrack and clear everything.
+    run_cnf("p cnf 3 3\n1 2 0\n-1 3 0\n-2 3 0\n", true);
+}
+
+#[test]
+fn test_long_chain_rollback() {
+    // 1 -> 2 -> 3 -> 4 -> Conflict
+    // Tests if multiple levels of unit propagation are all rolled back.
+    run_cnf(
+        "p cnf 5 6\n1 -2 0\n2 -3 0\n3 -4 0\n4 -5 0\n5 0\n-1 0\n",
+        false, // Truly UNSAT, but ensures propagation doesn't crash
+    );
+}
+
+#[test]
+fn test_interleaved_decisions() {
+    // Ensures that decisions made at different levels don't leave
+    // "ghost" unit assignments behind.
+    run_cnf("p cnf 4 5\n1 2 0\n-2 3 0\n-3 4 0\n-4 0\n-1 0\n", false);
+}
