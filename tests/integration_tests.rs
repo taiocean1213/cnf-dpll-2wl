@@ -248,3 +248,68 @@ fn test_interleaved_decisions() {
     // "ghost" unit assignments behind.
     run_cnf("p cnf 4 5\n1 2 0\n-2 3 0\n-3 4 0\n-4 0\n-1 0\n", false);
 }
+
+#[test]
+fn test_trail_leak_pollution() {
+    // Formula: (1 or 2) AND (-1 or 3) AND (-3)
+    // 1. Initial Unit Propagation: 3 must be False.
+    // 2. Decision: 1 is True.
+    // 3. Propagation: Because 1 is True and (-1 or 3), 3 must be True.
+    // 4. Conflict: 3 cannot be both True and False.
+    // 5. Backtrack: Undo decision 1.
+    //    BUG: If 3 is not on the trail, 3 is still marked 'True' in assignments!
+    // 6. Next Decision: Try 1 is False.
+    // 7. Check (1 or 2): Since 1 is False, 2 must be True.
+    // 8. Result: Should be SAT (1=False, 2=True, 3=False).
+    //    Your old code returns UNSAT because it thinks 3 is still True from step 3.
+
+    run_cnf("p cnf 3 3\n1 2 0\n-1 3 0\n-3 0\n", true);
+}
+
+#[test]
+fn test_2wl_stagnation_failure() {
+    // Formula:
+    // 1. (1 or 2 or 3)
+    // 2. (-1)
+    // 3. (-3)
+    // 4. (1 or 2) <- redundant but forces the check
+
+    // Logic:
+    // - Initially: Watchers for Clause 1 are at index 0 (lit 1) and 1 (lit 2).
+    // - Step 1: Unit Propagate -1. lit 1 is falsified.
+    // - Step 2: 2WL moves watcher from index 0 (lit 1) to index 2 (lit 3).
+    // - Step 3: Now Clause 1 watches (lit 2 and lit 3).
+    // - Step 4: Unit Propagate -3. lit 3 is falsified.
+    // - Step 5: 2WL sees lit 2 is the only one left. Unit propagates 2 = True.
+
+    // The Bug: If your backtrack logic or your 2WL update doesn't correctly
+    // handle the state of the "other" watcher, it can get stuck.
+    run_cnf("p cnf 3 4\n1 2 3 0\n-1 0\n-3 0\n1 2 0\n", true);
+}
+
+#[test]
+fn test_zombie_watcher_logic_error() {
+    // Clause 1: (1 or 2 or 3)
+    // Clause 2: (-1)
+    // Clause 3: (-2)
+    // Clause 4: (-3)
+    // This is clearly UNSAT.
+
+    // How the bug triggers:
+    // 1. Initially, Clause 1 watches 1 and 2.
+    // 2. Initial Prop: -1 is assigned. falsified=1.
+    // 3. update_clause swaps 1 and 2. It looks for a replacement for '1'.
+    // 4. It finds '3' and moves the watch.
+    // 5. Clause 1 now watches 2 and 3.
+    // 6. Initial Prop: -2 is assigned. falsified=2.
+    // 7. BUG: In your code, index 0 is '2'. It swaps it to index 1.
+    // 8. Now it looks for a replacement for index 1 (the literal '2').
+    // 9. It finds NONE. It looks at w0 (the literal '3').
+    // 10. Literal '3' is currently None (Unassigned).
+    // 11. Your code assigns 3 = True.
+    // 12. BUT, -3 is also an initial unit!
+    // If the order of initialization is slightly off, the 2WL pointers
+    // end up pointing at two False literals without triggering a conflict.
+
+    run_cnf("p cnf 3 4\n1 2 3 0\n-1 0\n-2 0\n-3 0\n", false);
+}
