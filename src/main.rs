@@ -1,6 +1,7 @@
-use cnf_dpll_2wl::Solver;
 use std::env;
 use std::process;
+
+use cnf_dpll_2wl::Solver;
 
 fn main() {
     let path = env::args().nth(1).expect("Usage: solver <file.cnf>");

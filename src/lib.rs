@@ -28,10 +28,19 @@ struct PropagationState<'a> {
     propagation_queue: &'a mut Vec<Literal>,
 }
 
+/// Represents a choice made by the solver during search.
+struct Decision {
+    var: usize,
+    tried_polarity: bool,
+    tried_both: bool,
+}
+
 pub struct Solver {
     pub clauses: Vec<Clause>,
     pub assignments: Vec<Option<bool>>,
     pub watch_lists: Vec<Vec<usize>>,
+    trail: Vec<usize>,
+    trail_lim: Vec<usize>,
 }
 
 impl Solver {
@@ -50,6 +59,8 @@ impl Solver {
             clauses,
             assignments: vec![None; variable_count + 1],
             watch_lists: vec![Vec::new(); (variable_count + 1) * 2],
+            trail: Vec::new(),
+            trail_lim: Vec::new(),
         };
 
         solver.initialize_watches();
@@ -60,10 +71,12 @@ impl Solver {
     pub fn lit_to_var(lit: Literal) -> usize {
         lit.abs() as usize
     }
+
     #[inline]
     pub fn lit_to_idx(lit: Literal) -> usize {
         (lit.abs() as usize * 2) + (lit < 0) as usize
     }
+
     #[inline]
     fn make_lit(var: usize, polarity: bool) -> Literal {
         if polarity { var as i32 } else { -(var as i32) }
@@ -86,10 +99,12 @@ impl Solver {
             .filter_map(|s| s.parse().ok())
             .take_while(|&val| val != 0)
             .collect();
-        let len = literals.len();
 
-        // Fix: Use saturating logic to ensure indices are 0 even if len is 0.
-        // The solve() method will handle the actual UNSAT logic for empty clauses.
+        if literals.is_empty() {
+            return;
+        }
+
+        let len = literals.len();
         clauses.push(Clause {
             literals,
             watched_indices: [0, 1.min(len.saturating_sub(1))],
@@ -99,7 +114,6 @@ impl Solver {
 
     fn initialize_watches(&mut self) {
         for (id, c) in self.clauses.iter().enumerate() {
-            // Only add to watch lists if the clause actually has literals
             if let Some(&lit0) = c.literals.get(c.watched_indices[0]) {
                 self.watch_lists[Self::lit_to_idx(lit0)].push(id);
             }
@@ -115,6 +129,21 @@ impl Solver {
         assignments[Self::lit_to_var(lit)].map(|val| val == (lit > 0))
     }
 
+    fn assign(&mut self, lit: Literal) {
+        let var = Self::lit_to_var(lit);
+        self.assignments[var] = Some(lit > 0);
+        self.trail.push(var);
+    }
+
+    fn undo_to_level(&mut self, level: usize) {
+        let pos = self.trail_lim[level];
+        while self.trail.len() > pos {
+            let var = self.trail.pop().unwrap();
+            self.assignments[var] = None;
+        }
+        self.trail_lim.truncate(level);
+    }
+
     pub fn propagate(&mut self, satisfied_lit: Literal) -> bool {
         let mut queue = vec![satisfied_lit];
         while let Some(l) = queue.pop() {
@@ -123,17 +152,6 @@ impl Solver {
             }
         }
         true
-    }
-
-    fn assign_and_propagate(&mut self, lit: Literal) -> bool {
-        match Self::get_literal_value(&self.assignments, lit) {
-            Some(false) => false,
-            Some(true) => true,
-            None => {
-                self.assignments[Self::lit_to_var(lit)] = Some(lit > 0);
-                self.propagate(lit)
-            }
-        }
     }
 
     fn process_watch_list(&mut self, satisfied_lit: Literal, queue: &mut Vec<Literal>) -> bool {
@@ -168,8 +186,6 @@ impl Solver {
         state: &mut PropagationState,
     ) -> (bool, bool) {
         c.visit_count += 1;
-
-        // Ensure the falsified literal is at index 1
         if c.literals[c.watched_indices[0]] == falsified {
             c.watched_indices.swap(0, 1);
         }
@@ -196,8 +212,85 @@ impl Solver {
         }
     }
 
+    fn pick_branching_variable(&self) -> Option<usize> {
+        self.assignments
+            .iter()
+            .enumerate()
+            .skip(1)
+            .find(|(_, a)| a.is_none())
+            .map(|(i, _)| i)
+    }
+
     pub fn solve(&mut self) -> bool {
-        // Fix: Explicitly check for empty clauses (UNSAT)
+        // 1. Initial Unit Propagation
+        if !self.initial_propagation() {
+            return false;
+        }
+
+        let mut decision_stack: Vec<Decision> = Vec::new();
+
+        loop {
+            let var = self.pick_branching_variable();
+
+            // Success Case: No more variables to assign
+            if var.is_none() {
+                return true;
+            }
+
+            // Make a new decision (defaulting to true)
+            let current_var = var.unwrap();
+            decision_stack.push(Decision {
+                var: current_var,
+                tried_polarity: true,
+                tried_both: false,
+            });
+
+            self.trail_lim.push(self.trail.len());
+            let lit = Self::make_lit(current_var, true);
+            self.assign(lit);
+
+            // If propagation fails, enter backtracking loop
+            if !self.propagate(lit) {
+                if !self.backtrack(&mut decision_stack) {
+                    return false; // Exhausted search space (UNSAT)
+                }
+            }
+        }
+    }
+
+    /// Handles the "Undo" logic and flipping polarities.
+    /// Returns true if we successfully pivoted to a new branch, false if UNSAT.
+    fn backtrack(&mut self, stack: &mut Vec<Decision>) -> bool {
+        while let Some(mut decision) = stack.pop() {
+            // If we've already tried both true and false for this variable,
+            // undo and keep popping up the stack.
+            if decision.tried_both {
+                self.undo_to_level(stack.len());
+                continue;
+            }
+
+            // Otherwise, flip the polarity and try again.
+            self.undo_to_level(stack.len());
+
+            decision.tried_polarity = !decision.tried_polarity;
+            decision.tried_both = true;
+
+            let lit = Self::make_lit(decision.var, decision.tried_polarity);
+            self.trail_lim.push(self.trail.len());
+            self.assign(lit);
+
+            let ok = self.propagate(lit);
+            stack.push(decision);
+
+            if ok {
+                return true;
+            }
+            // If flipping still causes a conflict, the loop will pop this again.
+        }
+        false
+    }
+
+    fn initial_propagation(&mut self) -> bool {
         if self.clauses.iter().any(|c| c.literals.is_empty()) {
             return false;
         }
@@ -209,39 +302,19 @@ impl Solver {
             .map(|c| c.literals[0])
             .collect();
 
-        if units.into_iter().any(|l| !self.assign_and_propagate(l)) {
-            return false;
-        }
-        self.solve_recursive()
-    }
-
-    fn solve_recursive(&mut self) -> bool {
-        let var_to_assign = self
-            .assignments
-            .iter()
-            .enumerate()
-            .skip(1)
-            .find(|(_, a)| a.is_none())
-            .map(|(i, _)| i);
-
-        let Some(var) = var_to_assign else {
-            return true;
-        };
-
-        for polarity in [true, false] {
-            let old_assignments = self.assignments.clone();
-            let old_watches = self.watch_lists.clone();
-
-            if self.assign_and_propagate(Self::make_lit(var, polarity)) {
-                if self.solve_recursive() {
-                    return true;
+        for l in units {
+            match Self::get_literal_value(&self.assignments, l) {
+                Some(false) => return false,
+                Some(true) => continue,
+                None => {
+                    self.assign(l);
+                    if !self.propagate(l) {
+                        return false;
+                    }
                 }
             }
-
-            self.assignments = old_assignments;
-            self.watch_lists = old_watches;
         }
-        false
+        true
     }
 
     pub fn print_model(&self) {
