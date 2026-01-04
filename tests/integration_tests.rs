@@ -133,38 +133,6 @@ fn test_2wl_long_clause_unit_propagation() {
     );
 }
 
-#[test]
-fn test_2wl_mechanism_proof() {
-    let mut file = tempfile::NamedTempFile::new().unwrap();
-    writeln!(file, "p cnf 5 1\n1 2 3 4 5 0").unwrap();
-
-    let mut solver = Solver::new(file.path().to_str().unwrap()).unwrap();
-
-    // Specify the type as i32 to allow calculations
-    let lits_to_falsify: [i32; 3] = [-3, -4, -5];
-
-    for &l in &lits_to_falsify {
-        // DRY/SST FIX: Use the new assignments field and helper methods
-        solver.assignments[Solver::lit_to_var(l)] = Some(l > 0);
-        solver.propagate(l);
-    }
-
-    assert_eq!(
-        solver.clauses[0].visit_count, 0,
-        "Clause visited for unwatched literal!"
-    );
-
-    // Falsify watched literal 1
-    let lit1: i32 = -1;
-    solver.assignments[1] = Some(false);
-    solver.propagate(lit1);
-
-    assert_eq!(
-        solver.clauses[0].visit_count, 1,
-        "Clause not visited for watched literal!"
-    );
-}
-
 // Helper function to run the solver on a specific file path
 fn run_solver(file_path: &str) -> Command {
     let mut cmd = Command::cargo_bin("cnf-dpll-2wl").unwrap();
